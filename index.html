@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="UTF-8">
+  <style>
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: transparent;
+      width: 100%;
+      height: 100%;
+    }
+
+    #visualizer-container {
+      position: fixed;
+      left: 50%;
+      transform: translateX(-50%);
+      font-family: monospace;
+      z-index: 1000;
+    }
+
+    #visualizer-canvas {
+      width: 100vw;
+      height: 100vh;
+      display: block;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="visualizer-container">
+    <canvas id="visualizer-canvas"></canvas>
+  </div>
+
+  <script>
+    //#region Config
+    const CONFIG = {
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        channelCount: 2,
+        sampleRate: 48000
+      },
+      analyser: {
+        fftSize: 32,
+        smoothingTimeConstant: 0.9,
+        minDecibels: -90,
+        maxDecibels: -10
+      },
+      geometry: {
+        edgeSteps: 20,
+        cornerRadius: 40,
+        horizontalMargin: 50,
+      },
+      animation: {
+        timeStep: 0.005,
+        baseAmp: 2.5,
+      },
+      audioFeedback: {
+        verticalAmp: 150,
+        horizontalAmp: 125,
+      },
+      style: {
+        fillColor: "rgba(226, 232, 247, 0.15)",
+        lineWidth: 5,
+        strokeColor: "rgba(78, 201, 255, 0.5)",
+      }
+    };
+    //#endregion
+
+    (async () => {
+      try {
+        //#region Init
+
+        // Get or create stream
+        let stream = window.currentStream;
+        if (!stream) {
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: CONFIG.audio
+          });
+          window.currentStream = stream;
+          console.log('New stream got, please reroute to the Monitor of your output device');
+        }
+
+        // DOM
+        const canvas = document.getElementById('visualizer-canvas');
+        const ctx = canvas.getContext('2d');
+
+        function resize() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = canvas.getBoundingClientRect();
+          canvas.width = rect.width * dpr;
+          canvas.height = rect.height * dpr;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+        window.addEventListener("resize", resize);
+        resize();
+
+        //#endregion
+        //#region Audio settings
+
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const source = audioCtx.createMediaStreamSource(stream);
+        const splitter = audioCtx.createChannelSplitter(2);
+        const analyserL = audioCtx.createAnalyser();
+        const analyserR = audioCtx.createAnalyser();
+
+        analyserL.fftSize = CONFIG.analyser.fftSize;
+        analyserL.smoothingTimeConstant = CONFIG.analyser.smoothingTimeConstant;
+        analyserL.minDecibels = CONFIG.analyser.minDecibels;
+        analyserL.maxDecibels = CONFIG.analyser.maxDecibels;
+
+        analyserR.fftSize = CONFIG.analyser.fftSize;
+        analyserR.smoothingTimeConstant = CONFIG.analyser.smoothingTimeConstant;
+        analyserR.minDecibels = CONFIG.analyser.minDecibels;
+        analyserR.maxDecibels = CONFIG.analyser.maxDecibels;
+
+        source.connect(splitter);
+        splitter.connect(analyserL, 0);
+        splitter.connect(analyserR, 1);
+
+        const dataL = new Uint8Array(analyserL.frequencyBinCount);
+        const dataR = new Uint8Array(analyserR.frequencyBinCount);
+
+        //#endregion
+        //#region Painting presets
+
+        const edgeSteps = CONFIG.geometry.edgeSteps;
+        const amp = CONFIG.animation.baseAmp;
+        let t = 0;
+
+        function generateRoundedRectPoints() {
+          const pts = [];
+
+          const left = CONFIG.geometry.horizontalMargin;
+          const right = canvas.width - CONFIG.geometry.horizontalMargin;
+          const topY = 0;
+          const bottom = canvas.height;
+
+          const w = right - left;
+          const h = bottom - topY;
+          const r = CONFIG.geometry.cornerRadius;
+
+          // top edge
+          for (let i = 0; i < edgeSteps; i++) {
+            const p = i / (edgeSteps - 1);
+            pts.push({ x: left + r + (w - 2 * r) * p, y: topY });
+          }
+
+          // right edge
+          for (let i = 0; i < edgeSteps; i++) {
+            const p = i / (edgeSteps - 1);
+            pts.push({ x: right, y: topY + r + (h - 2 * r) * p });
+          }
+
+          // bottom edge
+          for (let i = 0; i < edgeSteps; i++) {
+            const p = i / (edgeSteps - 1);
+            pts.push({ x: right - r - (w - 2 * r) * p, y: bottom });
+          }
+
+          // left edge
+          for (let i = 0; i < edgeSteps; i++) {
+            const p = i / (edgeSteps - 1);
+            pts.push({ x: left, y: bottom - r - (h - 2 * r) * p });
+          }
+
+          return pts;
+        }
+
+        function noise(a, t) {
+          return (Math.sin(a * 3 + t) * 0.6 + Math.sin(a * 5 + t * 0.7) * 0.4) * 2;
+        }
+
+        function computeNormals(points) {
+          const normals = [];
+          const n = points.length;
+          const centerX = canvas.width / 2;
+          const centerY = canvas.height / 2;
+
+          for (let i = 0; i < n; i++) {
+            const p = points[i];
+            // Vector from point to center
+            const dx = centerX - p.x;
+            const dy = centerY - p.y;
+            const len = Math.hypot(dx, dy);
+            normals.push({ nx: dx / len, ny: dy / len });
+          }
+          return normals;
+        }
+
+        function drawRoundedRectPath(points) {
+          ctx.beginPath();
+
+          // Start from a corner
+          const startIdx = Math.floor(edgeSteps / 2);
+          const startP = points[startIdx];
+          ctx.moveTo(startP.x, startP.y);
+
+          // Then line up to all points
+          for (let i = startIdx; i < points.length + startIdx; i++) {
+            const idx = i % points.length;
+            const nextIdx = (idx + 1) % points.length;
+
+            const p0 = points[idx];
+            const p1 = points[nextIdx];
+            const mx = (p0.x + p1.x) / 2;
+            const my = (p0.y + p1.y) / 2;
+
+            ctx.quadraticCurveTo(p0.x, p0.y, mx, my);
+          }
+
+          ctx.closePath();
+        }
+
+        //#endregion
+        //#region Draw
+
+        function draw() {
+          requestAnimationFrame(draw);
+
+          analyserL.getByteFrequencyData(dataL);
+          analyserR.getByteFrequencyData(dataR);
+
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+          // Spawn particles
+          const basePoints = generateRoundedRectPoints();
+          const normals = computeNormals(basePoints);
+          const total = basePoints.length;
+
+          t += CONFIG.animation.timeStep;
+
+          // Waved points
+          const warped = basePoints.map((p, i) => {
+            const angle = (i / total) * Math.PI * 2;
+            let offset = noise(angle, t) * amp;
+
+            /* Audio-feedback: vertical line */
+            const leftX = CONFIG.geometry.horizontalMargin;
+            const rightX = canvas.width - CONFIG.geometry.horizontalMargin;
+            const topY = 0;
+            const bottomY = canvas.height;
+            const centerX = canvas.width / 2;
+            const centerY = canvas.height / 2;
+
+            // Calculate distance from center for decay factor
+            const distFromCenter = Math.hypot(p.x - centerX, p.y - centerY);
+            const maxDist = Math.hypot(centerX, centerY);
+            const distRatio = distFromCenter / maxDist; // 0 -> 1
+            const falloff = Math.pow(distRatio, 2); // exponential decay
+
+            // Left vertical line
+            if (Math.abs(p.x - leftX) < 1) {
+              const yRatio = p.y / canvas.height; // 0 → 1
+              const freqIndex = dataL.length - Math.floor(yRatio * (dataL.length - 1)) - 1;
+              const audioAmp = dataL[freqIndex] / 255; // 0 → 1
+              offset += audioAmp * CONFIG.audioFeedback.verticalAmp * falloff;
+            }
+
+            // Right vertical line
+            if (Math.abs(p.x - rightX) < 1) {
+              const yRatio = p.y / canvas.height;
+              const freqIndex = dataR.length - Math.floor(yRatio * (dataR.length - 1)) - 1;
+              const audioAmp = dataR[freqIndex] / 255;
+              offset += audioAmp * CONFIG.audioFeedback.verticalAmp * falloff;
+            }
+
+            /* Audio-feedback: horizontal line(high frequency) */
+            if (Math.abs(p.y - topY) < 1) {
+              const xRatio = p.x / canvas.width; // 0 -> 1
+              // Use left channel for left and right channels for right
+              const data = xRatio < 0.5 ? dataL : dataR;
+              // High frequency: use the last 1/2 channels
+              const freqStart = Math.floor(data.length * 2 / 2);
+              const freqIndex = freqStart + Math.floor(xRatio * (data.length - freqStart));
+              const audioAmp = data[Math.min(freqIndex, data.length - 1)] / 255;
+              offset += audioAmp * CONFIG.audioFeedback.horizontalAmp * falloff;
+            }
+
+            /* Audio-feedback: horizontal line(low frequency) */
+            if (Math.abs(p.y - bottomY) < 1) {
+              const xRatio = p.x / canvas.width; // 0 → 1
+              // Use left channel for left and right channels for right
+              const data = xRatio < 0.5 ? dataL : dataR;
+              // Low frequency: use the last 1/8 channels
+              const freqEnd = Math.floor(data.length / 8);
+              const freqIndex = Math.floor(xRatio * freqEnd);
+              const audioAmp = data[freqIndex] / 255;
+              offset += audioAmp * CONFIG.audioFeedback.horizontalAmp * falloff;
+            }
+
+            return {
+              x: p.x + normals[i].nx * offset,
+              y: p.y + normals[i].ny * offset
+            };
+          });
+
+          // Outer fillin
+          ctx.save();
+          ctx.fillStyle = CONFIG.style.fillColor;
+          ctx.beginPath();
+          drawRoundedRectPath(warped);
+          ctx.rect(0, 0, canvas.width, canvas.height);
+          ctx.fill("evenodd");
+          ctx.restore();
+
+          // Waving lines
+          ctx.lineWidth = CONFIG.style.lineWidth;
+          ctx.strokeStyle = CONFIG.style.strokeColor;
+          ctx.beginPath();
+
+          // Start from top center
+          const topEdgeStart = 0;
+          const midTopIndex = topEdgeStart + Math.floor(edgeSteps / 2);
+
+          let startIdx = midTopIndex;
+          const firstP = warped[startIdx];
+          ctx.moveTo(firstP.x, firstP.y);
+
+          // Then line up to all points
+          for (let step = 0; step < warped.length; step++) {
+            const i = (startIdx + step) % warped.length;
+            const nextI = (i + 1) % warped.length;
+
+            const p0 = warped[i];
+            const p1 = warped[nextI];
+            const mx = (p0.x + p1.x) / 2;
+            const my = (p0.y + p1.y) / 2;
+
+            ctx.quadraticCurveTo(p0.x, p0.y, mx, my);
+          }
+
+          ctx.closePath();
+          ctx.stroke();
+        }
+
+        draw();
+
+        //#endregion
+      } catch (err) {
+        console.error('Visualizer launch error: ', err.name, err.message);
+      }
+    })();
+  </script>
+
+</body>
+
+</html>
